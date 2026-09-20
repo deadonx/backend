@@ -3,23 +3,8 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 
-// 🔥 NAYA 1: Firebase Admin import karo
-const admin = require('firebase-admin');
-
-// 🔥 NAYA 2: Service Account Key (Firebase se jo download ki thi)
-const serviceAccount = require('./serviceAccountKey.json');
-
-// 🔥 NAYA 3: Firebase ko start karo
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-});
-
 const app = express();
 app.use(cors());
-
-// 🔥 NAYA 4: JSON format padhne ke liye (Notification data aayega isme)
-app.use(express.json());
-
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -29,45 +14,18 @@ const io = new Server(server, {
   }
 });
 
-// ==============================================================
-// 🔥 NAYA 5: NOTIFICATION WALA RASTA (POST API) 🔥
-// ==============================================================
-app.post('/send-notification', async (req, res) => {
-  const { token, title, body } = req.body;
-
-  if (!token) {
-    return res.status(400).send("Token is required");
-  }
-
-  const message = {
-    notification: {
-      title: title,
-      body: body
-    },
-    token: token
-  };
-
-  try {
-    const response = await admin.messaging().send(message);
-    console.log("Notification sent successfully:", response);
-    res.status(200).send("Sent!");
-  } catch (error) {
-    console.log("Error sending notification:", error);
-    res.status(500).send(error.message);
-  }
-});
-
-// ==============================================================
-// PURANA WEBRTC (VIDEO CALL) WALA CODE (Ekdum safe aur same hai)
-// ==============================================================
+// Firebase ke rooms node ki tarah memory (RAM) me rooms store karne ke liye
 let activeRooms = {}; 
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
+  // Jab user NEXT click kare ya pehli baar join kare
   socket.on('findStranger', () => {
+    // 1. Pehle se kisi room me ho toh use saaf karo
     leaveCurrentRoom(socket);
 
+    // 2. Dekho koi single banda kisi room me wait kar raha hai kya
     let foundRoomId = null;
     for (const roomId in activeRooms) {
       if (activeRooms[roomId].length === 1) { 
@@ -77,16 +35,19 @@ io.on('connection', (socket) => {
     }
 
     if (foundRoomId) {
+      // Room mil gaya! Ghuus jao usme
       activeRooms[foundRoomId].push(socket.id);
       socket.join(foundRoomId);
       
       const callerId = activeRooms[foundRoomId][0]; 
       
+      // Dono ko unka role aur room ID ek sath bhej do
       io.to(callerId).emit('matchFound', { roomId: foundRoomId, role: 'caller' });
       io.to(socket.id).emit('matchFound', { roomId: foundRoomId, role: 'callee' });
       
       console.log(`Matched! Room: ${foundRoomId}`);
     } else {
+      // Koi khali room nahi mila toh naya room bana kar khud wait karo
       const newRoomId = 'room_' + socket.id + '_' + Date.now();
       activeRooms[newRoomId] = [socket.id]; 
       socket.join(newRoomId);
@@ -94,20 +55,24 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ✅ HANDSHAKE: Callee (baad me aane wala) bata raha hai ki uska camera/engine ready hai
   socket.on('calleeReady', (roomId) => {
     socket.to(roomId).emit('calleeReady');
   });
 
+  // WebRTC Signaling Channels
   socket.on('webrtcOffer', (data) => socket.to(data.roomId).emit('webrtcOffer', data.offer));
   socket.on('webrtcAnswer', (data) => socket.to(data.roomId).emit('webrtcAnswer', data.answer));
   socket.on('iceCandidate', (data) => socket.to(data.roomId).emit('iceCandidate', data.candidate));
 
+  // Jab user NEXT dabaye ya window/tab close kare
   socket.on('leaveChat', () => leaveCurrentRoom(socket));
   socket.on('disconnect', () => {
     leaveCurrentRoom(socket);
     console.log('User disconnected:', socket.id);
   });
 
+  // Firebase style room delete logic: Ek bhi banda nikla toh room destroy!
   function leaveCurrentRoom(sock) {
     for (const roomId in activeRooms) {
       if (activeRooms[roomId].includes(sock.id)) {
@@ -121,8 +86,6 @@ io.on('connection', (socket) => {
   }
 });
 
-// 🔥 NAYA 6: Render ke liye process.env.PORT jaruri hota hai
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(3001, () => {
+  console.log('Firebase-style Handshake Server running on port 3001');
 });
