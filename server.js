@@ -2,90 +2,97 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
+const Redis = require('ioredis');
+const { createAdapter } = require('@socket.io/redis-adapter');
 
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
 
+// 🔥 1. REDIS SETUP 🔥
+// Yahan apna Upstash wala REDIS_URL daaliye
+const REDIS_URL = process.env.REDIS_URL || "rediss://default:AASDASD123123@cool-tiger-32000.upstash.io:32000";
+
+const pubClient = new Redis(REDIS_URL);
+const subClient = pubClient.duplicate();
+const redisClient = new Redis(REDIS_URL); // General data (EXP, Queue) ke liye
+
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Firebase ke rooms node ki tarah memory (RAM) me rooms store karne ke liye
-let activeRooms = {}; 
+// 🔥 2. LINK SOCKET.IO WITH REDIS (For Multi-Server) 🔥
+// Is ek line se Server 1 aur Server 2 aapas me baat kar payenge
+io.adapter(createAdapter(pubClient, subClient));
+
+pubClient.on('connect', () => console.log('🔥 Redis Pub/Sub Connected!'));
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // Jab user NEXT click kare ya pehli baar join kare
-  socket.on('findStranger', () => {
-    // 1. Pehle se kisi room me ho toh use saaf karo
-    leaveCurrentRoom(socket);
+  // ==========================================
+  // 🔥 THE NEW REDIS MATCHMAKING SYSTEM 🔥
+  // ==========================================
+  socket.on('findStranger', async () => {
+    try {
+      // 1. Redis ke 'waiting_queue' se ek banda nikalo (LPOP)
+      const partnerId = await redisClient.lpop('appie_waiting_queue');
 
-    // 2. Dekho koi single banda kisi room me wait kar raha hai kya
-    let foundRoomId = null;
-    for (const roomId in activeRooms) {
-      if (activeRooms[roomId].length === 1) { 
-        foundRoomId = roomId; 
-        break; 
+      if (partnerId && partnerId !== socket.id) {
+        // MATCH MIL GAYA! 
+        const roomId = 'room_' + partnerId + '_' + socket.id;
+        
+        // Dono ko 'matchFound' bhej do (Adapter automatically Server 1 ya 2 dhund lega)
+        io.to(partnerId).emit('matchFound', { roomId: roomId, role: 'caller' });
+        io.to(socket.id).emit('matchFound', { roomId: roomId, role: 'callee' });
+        
+        console.log(`Matched! Room: ${roomId}`);
+      } else {
+        // KOI KHALI NAHI HAI: Khud ko line (queue) me lagao (RPUSH)
+        await redisClient.rpush('appie_waiting_queue', socket.id);
+        
+        // Agar user app band kar de, toh 60 sec baad wo line se khud hat jayega
+        await redisClient.expire('appie_waiting_queue', 60); 
+        console.log(`User ${socket.id} waiting in Redis queue...`);
       }
-    }
-
-    if (foundRoomId) {
-      // Room mil gaya! Ghuus jao usme
-      activeRooms[foundRoomId].push(socket.id);
-      socket.join(foundRoomId);
-      
-      const callerId = activeRooms[foundRoomId][0]; 
-      
-      // Dono ko unka role aur room ID ek sath bhej do
-      io.to(callerId).emit('matchFound', { roomId: foundRoomId, role: 'caller' });
-      io.to(socket.id).emit('matchFound', { roomId: foundRoomId, role: 'callee' });
-      
-      console.log(`Matched! Room: ${foundRoomId}`);
-    } else {
-      // Koi khali room nahi mila toh naya room bana kar khud wait karo
-      const newRoomId = 'room_' + socket.id + '_' + Date.now();
-      activeRooms[newRoomId] = [socket.id]; 
-      socket.join(newRoomId);
-      console.log(`Created new room: ${newRoomId}`);
+    } catch (err) {
+      console.error("Redis Matchmaking Error:", err);
     }
   });
 
-  // ✅ HANDSHAKE: Callee (baad me aane wala) bata raha hai ki uska camera/engine ready hai
+  // Jab Android app se 'matchFound' aaye, tab actually Socket room me join karna hai
+  socket.on('joinRoom', (roomId) => {
+    socket.join(roomId);
+  });
+
+  // ✅ HANDSHAKE: Callee (baad me aane wala) bata raha hai ki uska camera ready hai
   socket.on('calleeReady', (roomId) => {
     socket.to(roomId).emit('calleeReady');
   });
 
-  // WebRTC Signaling Channels
+  // ==========================================
+  // 🔥 WEBRTC VIDEO SIGNALING (Remains Same)
+  // ==========================================
   socket.on('webrtcOffer', (data) => socket.to(data.roomId).emit('webrtcOffer', data.offer));
   socket.on('webrtcAnswer', (data) => socket.to(data.roomId).emit('webrtcAnswer', data.answer));
   socket.on('iceCandidate', (data) => socket.to(data.roomId).emit('iceCandidate', data.candidate));
 
-  // Jab user NEXT dabaye ya window/tab close kare
-  socket.on('leaveChat', () => leaveCurrentRoom(socket));
-  socket.on('disconnect', () => {
-    leaveCurrentRoom(socket);
-    console.log('User disconnected:', socket.id);
+  // ==========================================
+  // 🔥 DISCONNECT & SKIP LOGIC
+  // ==========================================
+  socket.on('leaveChat', (roomId) => {
+    socket.to(roomId).emit('strangerDisconnected');
+    socket.leave(roomId);
   });
 
-  // Firebase style room delete logic: Ek bhi banda nikla toh room destroy!
-  function leaveCurrentRoom(sock) {
-    for (const roomId in activeRooms) {
-      if (activeRooms[roomId].includes(sock.id)) {
-        sock.to(roomId).emit('strangerDisconnected');
-        sock.leave(roomId);
-        delete activeRooms[roomId]; 
-        console.log(`Room Destroyed: ${roomId}`);
-        break;
-      }
-    }
-  }
+  socket.on('disconnect', async () => {
+    console.log('User disconnected:', socket.id);
+    // Queue me tha toh nikalne ki koshish karega (halaki 60 sec me khud delete ho jayega)
+    await redisClient.lrem('appie_waiting_queue', 0, socket.id);
+  });
 });
 
-server.listen(3001, () => {
-  console.log('Firebase-style Handshake Server running on port 3001');
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`🚀 Appie Redis Master Server running on port ${PORT}`);
 });
