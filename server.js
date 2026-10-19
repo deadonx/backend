@@ -10,48 +10,50 @@ app.use(cors());
 const server = http.createServer(app);
 
 // 🔥 1. REDIS SETUP 🔥
-// Yahan apna Upstash wala REDIS_URL daaliye
-const REDIS_URL = process.env.REDIS_URL || "rediss://default:AASDASD123123@cool-tiger-32000.upstash.io:32000";
+const REDIS_URL = process.env.REDIS_URL || "rediss://default:gQAAAAAAAcMpAAIgcDI3M2UyMDQwNGJhN2M0MWNhYmVlNGQzYTlmY2EyMzlmMQ@credible-sunbird-115497.upstash.io:6379";
 
-const pubClient = new Redis(REDIS_URL);
+// Render aur Upstash ke secure SSL connection ke liye tls option zaroori hai
+const redisOptions = {
+    tls: { rejectUnauthorized: false },
+    retryStrategy: (times) => Math.min(times * 50, 2000)
+};
+
+const pubClient = new Redis(REDIS_URL, redisOptions);
 const subClient = pubClient.duplicate();
-const redisClient = new Redis(REDIS_URL); // General data (EXP, Queue) ke liye
+const redisClient = new Redis(REDIS_URL, redisOptions); // General data (Queue) ke liye
 
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 // 🔥 2. LINK SOCKET.IO WITH REDIS (For Multi-Server) 🔥
-// Is ek line se Server 1 aur Server 2 aapas me baat kar payenge
 io.adapter(createAdapter(pubClient, subClient));
 
-pubClient.on('connect', () => console.log('🔥 Redis Pub/Sub Connected!'));
+pubClient.on('connect', () => console.log('🔥 Redis Pub/Sub & Master Server Connected!'));
 
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
   // ==========================================
-  // 🔥 THE NEW REDIS MATCHMAKING SYSTEM 🔥
+  // 🔥 THE REDIS MATCHMAKING SYSTEM 🔥
   // ==========================================
   socket.on('findStranger', async () => {
     try {
-      // 1. Redis ke 'waiting_queue' se ek banda nikalo (LPOP)
+      // 1. Redis ke queue se ek banda nikalo (LPOP)
       const partnerId = await redisClient.lpop('appie_waiting_queue');
 
       if (partnerId && partnerId !== socket.id) {
         // MATCH MIL GAYA! 
         const roomId = 'room_' + partnerId + '_' + socket.id;
         
-        // Dono ko 'matchFound' bhej do (Adapter automatically Server 1 ya 2 dhund lega)
+        // Dono ko 'matchFound' bhej do
         io.to(partnerId).emit('matchFound', { roomId: roomId, role: 'caller' });
         io.to(socket.id).emit('matchFound', { roomId: roomId, role: 'callee' });
         
         console.log(`Matched! Room: ${roomId}`);
       } else {
-        // KOI KHALI NAHI HAI: Khud ko line (queue) me lagao (RPUSH)
+        // KOI KHALI NAHI HAI: Queue me lagao (RPUSH)
         await redisClient.rpush('appie_waiting_queue', socket.id);
-        
-        // Agar user app band kar de, toh 60 sec baad wo line se khud hat jayega
         await redisClient.expire('appie_waiting_queue', 60); 
         console.log(`User ${socket.id} waiting in Redis queue...`);
       }
@@ -60,39 +62,57 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Jab Android app se 'matchFound' aaye, tab actually Socket room me join karna hai
+  // Socket room join karna
   socket.on('joinRoom', (roomId) => {
     socket.join(roomId);
   });
 
-  // ✅ HANDSHAKE: Callee (baad me aane wala) bata raha hai ki uska camera ready hai
+  // Callee ready signal
   socket.on('calleeReady', (roomId) => {
     socket.to(roomId).emit('calleeReady');
   });
 
   // ==========================================
-  // 🔥 WEBRTC VIDEO SIGNALING (Remains Same)
+  // 🔥 WEBRTC VIDEO SIGNALING (With Name & DP Support)
   // ==========================================
-  socket.on('webrtcOffer', (data) => socket.to(data.roomId).emit('webrtcOffer', data.offer));
-  socket.on('webrtcAnswer', (data) => socket.to(data.roomId).emit('webrtcAnswer', data.answer));
-  socket.on('iceCandidate', (data) => socket.to(data.roomId).emit('iceCandidate', data.candidate));
+  socket.on('webrtcOffer', (data) => {
+    // data ke andar offer, peerName, peerDp sab kuch aayega aur seedha pass ho jayega
+    socket.to(data.roomId).emit('webrtcOffer', data);
+  });
+
+  socket.on('webrtcAnswer', (data) => {
+    socket.to(data.roomId).emit('webrtcAnswer', data);
+  });
+
+  socket.on('iceCandidate', (data) => {
+    socket.to(data.roomId).emit('iceCandidate', data);
+  });
 
   // ==========================================
   // 🔥 DISCONNECT & SKIP LOGIC
   // ==========================================
-  socket.on('leaveChat', (roomId) => {
-    socket.to(roomId).emit('strangerDisconnected');
-    socket.leave(roomId);
+  socket.on('leaveChat', async (roomId) => {
+    if (roomId) {
+      socket.to(roomId).emit('strangerDisconnected');
+      socket.leave(roomId);
+    }
+    await redisClient.lrem('appie_waiting_queue', 0, socket.id);
   });
 
   socket.on('disconnect', async () => {
     console.log('User disconnected:', socket.id);
-    // Queue me tha toh nikalne ki koshish karega (halaki 60 sec me khud delete ho jayega)
     await redisClient.lrem('appie_waiting_queue', 0, socket.id);
+    
+    // Agar kisi room me tha toh stranger ko notify kar do
+    socket.rooms.forEach(roomId => {
+        if (roomId !== socket.id) {
+            socket.to(roomId).emit('strangerDisconnected');
+        }
+    });
   });
 });
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
   console.log(`🚀 Appie Redis Master Server running on port ${PORT}`);
 });
