@@ -33,13 +33,13 @@ pubClient.on('connect', () => console.log('🔥 Redis Pub/Sub Connected!'));
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // 🔥 FAST BUNDLE MATCHMAKING (Across 2 Render Servers) 🔥
+  // 🔥 INSTANT MATCHMAKING LOGIC 🔥
   socket.on('findStranger', async (userProfile) => {
     try {
-      // 1. Pehle is user ki koi purani duplicate entry queue me ho toh hatao
+      // 1. Purani aadhi-adhuri entry queue se hatao
       await redisClient.lrem('appie_waiting_queue', 0, socket.id);
 
-      // 2. User ka profile bundle Redis me 2 minute ke liye cache karo
+      // 2. User ka profile data Redis me cache karo (Sirf 120 seconds ke liye)
       const myMeta = (typeof userProfile === 'object' && userProfile !== null) ? userProfile : {};
       myMeta.socketId = socket.id;
       await redisClient.set(`meta:${socket.id}`, JSON.stringify(myMeta), 'EX', 120);
@@ -47,43 +47,40 @@ io.on('connection', (socket) => {
       let matchedPartnerId = null;
       let partnerMeta = {};
 
-      // 3. Queue se tab tak pop karo jab tak ek LIVE aur ALAG user na mil jaye
+      // 3. Queue search loop
       while (true) {
         const candidateId = await redisClient.lpop('appie_waiting_queue');
         if (!candidateId) break; // Queue khali hai
 
         if (candidateId === socket.id) continue; // Khud se match mat karo
 
-        // Check karo ki candidate abhi bhi kisi Render server par connected hai ya nahi
-        const activeSockets = await io.in(candidateId).allSockets();
-        if (!activeSockets || activeSockets.size === 0) {
-          continue; // Dead/Ghost socket hai, skip karo!
-        }
-
-        // Candidate ka profile bundle nikalo
+        // 🔥 NAYA FIX: Active connection check karne ka fast tarika
         const rawMeta = await redisClient.get(`meta:${candidateId}`);
-        if (rawMeta) {
-          try { partnerMeta = JSON.parse(rawMeta); } catch (e) {}
+        if (!rawMeta) {
+            // Agar meta delete ho gaya (user chhod ke chala gaya), toh is ghost ko ignore karo
+            continue;
         }
 
-        // Agar dono ki Firebase UID same hai, toh wapas queue me daal kar chhod do
+        try { partnerMeta = JSON.parse(rawMeta); } catch (e) {}
+
+        // Dono ki Firebase UID same ho, toh match mat karo (Same account on 2 phones)
         if (myMeta.uid && partnerMeta.uid && myMeta.uid === partnerMeta.uid) {
           await redisClient.rpush('appie_waiting_queue', candidateId);
           break;
         }
 
         matchedPartnerId = candidateId;
-        break;
+        break; // Match mil gaya!
       }
 
       if (matchedPartnerId) {
         const roomId = `room_${matchedPartnerId}_${socket.id}`;
 
-        // Server khud dono sockets ko room me join kara dega (0ms delay)
+        // Dono sockets ko room me dalna (Across servers)
         io.in(matchedPartnerId).socketsJoin(roomId);
         socket.join(roomId);
 
-        // Dono ko matchFound ke sath samne wale ka pura Profile Bundle bhej do!
+        // Dono ko Match Found aur ek dusre ka profile data bhejo
         io.to(matchedPartnerId).emit('matchFound', {
           roomId: roomId,
           role: 'caller',
@@ -98,7 +95,7 @@ io.on('connection', (socket) => {
 
         console.log(`⚡ Instant Match! Room: ${roomId}`);
       } else {
-        // Koi nahi mila, queue me lagao
+        // Queue me dalo
         await redisClient.rpush('appie_waiting_queue', socket.id);
         await redisClient.expire('appie_waiting_queue', 120);
         console.log(`User ${socket.id} waiting in Redis queue...`);
@@ -117,35 +114,34 @@ io.on('connection', (socket) => {
   });
 
   socket.on('webrtcOffer', (data) => {
-    if (data && data.roomId) {
-      socket.to(data.roomId).emit('webrtcOffer', data.offer || data);
-    }
+    if (data && data.roomId) socket.to(data.roomId).emit('webrtcOffer', data.offer || data);
   });
 
   socket.on('webrtcAnswer', (data) => {
-    if (data && data.roomId) {
-      socket.to(data.roomId).emit('webrtcAnswer', data.answer || data);
-    }
+    if (data && data.roomId) socket.to(data.roomId).emit('webrtcAnswer', data.answer || data);
   });
 
   socket.on('iceCandidate', (data) => {
-    if (data && data.roomId) {
-      socket.to(data.roomId).emit('iceCandidate', data.candidate || data);
-    }
+    if (data && data.roomId) socket.to(data.roomId).emit('iceCandidate', data.candidate || data);
   });
 
-  socket.on('leaveChat', async (roomId) => {
+  // Jab user Next dabata hai ya room chhodta hai
+  socket.on('leaveChat', async () => {
     await redisClient.lrem('appie_waiting_queue', 0, socket.id);
-    if (roomId) {
-      socket.to(roomId).emit('strangerDisconnected');
-      socket.leave(roomId);
-    }
+    socket.rooms.forEach((roomId) => {
+      if (roomId !== socket.id) {
+        socket.to(roomId).emit('strangerDisconnected');
+        socket.leave(roomId);
+      }
+    });
   });
 
+  // Jab user App close karta hai ya internet jata hai
   socket.on('disconnect', async () => {
     console.log('User disconnected:', socket.id);
     await redisClient.lrem('appie_waiting_queue', 0, socket.id);
     await redisClient.del(`meta:${socket.id}`);
+    
     socket.rooms.forEach((roomId) => {
       if (roomId !== socket.id) {
         socket.to(roomId).emit('strangerDisconnected');
