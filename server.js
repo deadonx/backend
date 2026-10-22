@@ -9,6 +9,12 @@ const app = express();
 app.use(cors());
 const server = http.createServer(app);
 
+// ==========================================
+// 🔥 SUPABASE CONFIG (Yahan apni keys daalein) 🔥
+// ==========================================
+const SUPABASE_URL = "https://pxzofsaallaeezqyofin.supabase.co"; // Apna Project URL yahan daalein
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB4em9mc2FhbGxhZWV6cXlvZmluIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2Njk0MDYsImV4cCI6MjEwODI0NTQwNn0.yiPaUkq6GRNK8rB-wYqj9hlZTr7Mp4_6fPCk-Vv-Lgw"; // Apni Publishable key yahan daalein
+
 const REDIS_URL = process.env.REDIS_URL || "rediss://default:gQAAAAAAAcMpAAIgcDI3M2UyMDQwNGJhN2M0MWNhYmVlNGQzYTlmY2EyMzlmMQ@credible-sunbird-115497.upstash.io:6379";
 
 const redisOptions = {
@@ -30,16 +36,68 @@ io.adapter(createAdapter(pubClient, subClient));
 
 pubClient.on('connect', () => console.log('🔥 Redis Pub/Sub Connected!'));
 
+// ==========================================
+// 🔥 REST APIs (Android App Data ke liye) 🔥
+// ==========================================
+
+// 1. App open hone par Profile Data lane ke liye API
+app.get('/getProfile', async (req, res) => {
+  const uid = req.query.uid;
+  if (!uid) return res.status(400).json({ error: "UID missing" });
+
+  try {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/public_profiles?uid=eq.${uid}&select=*`, {
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+      }
+    });
+    const data = await response.json();
+    
+    if (data && data.length > 0) {
+      res.json(data[0]); // Data mil gaya
+    } else {
+      res.json({ error: "Profile not found" });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 2. Call khatam hone ke baad EXP update karne ke liye API
+app.post('/updateExp', express.json(), async (req, res) => {
+  const { uid, newExp } = req.body;
+  if (!uid || newExp === undefined) return res.status(400).json({ error: "Data missing" });
+
+  try {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/public_profiles?uid=eq.${uid}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+        'Prefer': 'return=minimal'
+      },
+      body: JSON.stringify({ exp: newExp })
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ==========================================
+// 🔥 SOCKET.IO LIVE MATCHMAKING LOGIC 🔥
+// ==========================================
+
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // 🔥 INSTANT MATCHMAKING LOGIC 🔥
   socket.on('findStranger', async (userProfile) => {
     try {
-      // 1. Purani aadhi-adhuri entry queue se hatao
       await redisClient.lrem('appie_waiting_queue', 0, socket.id);
 
-      // 2. User ka profile data Redis me cache karo (Sirf 120 seconds ke liye)
       const myMeta = (typeof userProfile === 'object' && userProfile !== null) ? userProfile : {};
       myMeta.socketId = socket.id;
       await redisClient.set(`meta:${socket.id}`, JSON.stringify(myMeta), 'EX', 120);
@@ -47,40 +105,32 @@ io.on('connection', (socket) => {
       let matchedPartnerId = null;
       let partnerMeta = {};
 
-      // 3. Queue search loop
       while (true) {
         const candidateId = await redisClient.lpop('appie_waiting_queue');
-        if (!candidateId) break; // Queue khali hai
+        if (!candidateId) break; 
 
-        if (candidateId === socket.id) continue; // Khud se match mat karo
+        if (candidateId === socket.id) continue; 
 
-        // 🔥 NAYA FIX: Active connection check karne ka fast tarika
         const rawMeta = await redisClient.get(`meta:${candidateId}`);
-        if (!rawMeta) {
-            // Agar meta delete ho gaya (user chhod ke chala gaya), toh is ghost ko ignore karo
-            continue;
-        }
+        if (!rawMeta) continue;
 
         try { partnerMeta = JSON.parse(rawMeta); } catch (e) {}
 
-        // Dono ki Firebase UID same ho, toh match mat karo (Same account on 2 phones)
         if (myMeta.uid && partnerMeta.uid && myMeta.uid === partnerMeta.uid) {
           await redisClient.rpush('appie_waiting_queue', candidateId);
           break;
         }
 
         matchedPartnerId = candidateId;
-        break; // Match mil gaya!
+        break; 
       }
 
       if (matchedPartnerId) {
         const roomId = `room_${matchedPartnerId}_${socket.id}`;
 
-        // Dono sockets ko room me dalna (Across servers)
         io.in(matchedPartnerId).socketsJoin(roomId);
         socket.join(roomId);
 
-        // Dono ko Match Found aur ek dusre ka profile data bhejo
         io.to(matchedPartnerId).emit('matchFound', {
           roomId: roomId,
           role: 'caller',
@@ -95,7 +145,6 @@ io.on('connection', (socket) => {
 
         console.log(`⚡ Instant Match! Room: ${roomId}`);
       } else {
-        // Queue me dalo
         await redisClient.rpush('appie_waiting_queue', socket.id);
         await redisClient.expire('appie_waiting_queue', 120);
         console.log(`User ${socket.id} waiting in Redis queue...`);
@@ -125,7 +174,6 @@ io.on('connection', (socket) => {
     if (data && data.roomId) socket.to(data.roomId).emit('iceCandidate', data.candidate || data);
   });
 
-  // Jab user Next dabata hai ya room chhodta hai
   socket.on('leaveChat', async () => {
     await redisClient.lrem('appie_waiting_queue', 0, socket.id);
     socket.rooms.forEach((roomId) => {
@@ -136,7 +184,6 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Jab user App close karta hai ya internet jata hai
   socket.on('disconnect', async () => {
     console.log('User disconnected:', socket.id);
     await redisClient.lrem('appie_waiting_queue', 0, socket.id);
@@ -152,5 +199,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`🚀 Appie Redis Master Server running on port ${PORT}`);
+  console.log(`🚀 Appie Server running on port ${PORT}`);
 });
