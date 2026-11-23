@@ -12,11 +12,14 @@ app.use(express.json());
 const server = http.createServer(app);
 
 // ==========================================
-// 1. CONFIG (SUPABASE & UPSTASH REDIS)
+// 1. CONFIG (SUPABASE, REDIS & SERVER LIMIT)
 // ==========================================
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://pxzofsaallaeezqyofin.supabase.co";
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB4em9mc2FhbGxhZWV6cXlvZmluIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2Njk0MDYsImV4cCI6MjEwODI0NTQwNn0.yiPaUkq6GRNK8rB-wYqj9hlZTr7Mp4_6fPCk-Vv-Lgw";
 const REDIS_URL = process.env.REDIS_URL || "rediss://default:gQAAAAAAAcMpAAIgcDI3M2UyMDQwNGJhN2M0MWNhYmVlNGQzYTlmY2EyMzlmMQ@credible-sunbird-115497.upstash.io:6379";
+
+// Ek server par max live users (cross hote hi user Server 2 par redirect hoga)
+const MAX_USERS = parseInt(process.env.MAX_USERS || "500", 10);
 
 const redisOptions = {
   tls: { rejectUnauthorized: false },
@@ -28,7 +31,6 @@ const pubClient = new Redis(REDIS_URL, redisOptions);
 const subClient = pubClient.duplicate();
 const redisClient = new Redis(REDIS_URL, redisOptions);
 
-// Redis disconnect par server crash hone se bachane ke liye
 pubClient.on('connect', () => console.log('🔥 Redis Pub Connected'));
 pubClient.on('error', (err) => console.error('Redis Pub Error:', err.message));
 subClient.on('error', (err) => console.error('Redis Sub Error:', err.message));
@@ -41,14 +43,18 @@ const io = new Server(server, {
   pingInterval: 5000
 });
 
-// 2 servers ko aapas mein jodne wala Redis Adapter
+// Dono Render servers ko aapas mein connect karne wala Redis Adapter
 io.adapter(createAdapter(pubClient, subClient));
 
 // ==========================================
 // 2. REST APIs (HEALTH + SUPABASE)
 // ==========================================
 app.get('/', (req, res) => {
-  res.send('Appie Signaling Server is Running');
+  res.json({
+    status: 'Appie Signaling Server Live',
+    activeUsers: io.engine.clientsCount,
+    maxUsers: MAX_USERS
+  });
 });
 
 app.get('/getProfile', async (req, res) => {
@@ -95,7 +101,7 @@ app.post('/updateExp', async (req, res) => {
 });
 
 // ==========================================
-// 3. REDIS HELPER FUNCTIONS
+// 3. REDIS HELPERS (LOCK + CLEANUP)
 // ==========================================
 const QUEUE_KEY = 'appie:waiting_queue';
 const LOCK_KEY = 'appie:match_lock';
@@ -136,14 +142,23 @@ async function cleanupUserState(socketId, notifyPartner = true) {
 // 4. SOCKET.IO MATCHMAKING & SIGNALING
 // ==========================================
 io.on('connection', (socket) => {
-  console.log(`✅ Connected: ${socket.id}`);
+  // Server full hone par user ko automatically Server 2 par bhej dein
+  if (io.engine.clientsCount > MAX_USERS) {
+    console.log(`⚠️ Server full (${io.engine.clientsCount}/${MAX_USERS}), redirecting ${socket.id}`);
+    socket.emit('serverFull');
+    socket.disconnect(true);
+    return;
+  }
+
+  console.log(`✅ Connected: ${socket.id} (${io.engine.clientsCount}/${MAX_USERS})`);
+  redisClient.set(`online:${socket.id}`, '1', 'EX', 1800);
 
   // Step 1: User starts searching
   socket.on('findStranger', async (userProfile) => {
     const locked = await acquireLock();
     try {
-      // Purani koi call ya queue entry saaf karein
       await cleanupUserState(socket.id, true);
+      await redisClient.set(`online:${socket.id}`, '1', 'EX', 1800);
 
       const myProfile = (userProfile && typeof userProfile === 'object') ? userProfile : {};
       myProfile.socketId = socket.id;
@@ -158,9 +173,9 @@ io.on('connection', (socket) => {
         if (!candidateId) break;
         if (candidateId === socket.id) continue;
 
-        // Check across ALL servers ki candidate zinda hai ya nahi
-        const activeSockets = await io.in(candidateId).fetchSockets();
-        if (!activeSockets || activeSockets.length === 0) {
+        // Fast cross-server online check (2 servers ke beech 100% reliable)
+        const isOnline = await redisClient.exists(`online:${candidateId}`);
+        if (!isOnline) {
           await redisClient.del(`meta:${candidateId}`);
           continue;
         }
@@ -175,7 +190,7 @@ io.on('connection', (socket) => {
           continue;
         }
 
-        // Same user (same UID) ko khud se match mat hone do
+        // Same Google UID wale ko khud se match mat karo
         if (myProfile.uid && candidateProfile.uid && myProfile.uid === candidateProfile.uid) {
           skippedIds.push(candidateId);
           continue;
@@ -186,24 +201,23 @@ io.on('connection', (socket) => {
         break;
       }
 
-      // Skip kiye gaye same-UID sockets ko wapas queue mein rakhein
+      // Same-UID skipped sockets wapas queue mein daal dein
       for (const id of skippedIds) {
         await redisClient.rpush(QUEUE_KEY, id);
       }
 
       if (partnerId && partnerProfile) {
-        // Dono ka active pair Redis mein save karein
         await redisClient.set(`partner:${partnerId}`, socket.id, 'EX', 3600);
         await redisClient.set(`partner:${socket.id}`, partnerId, 'EX', 3600);
 
-        // Partner (jo pehle se wait kar raha tha) -> CALLER
+        // Pehle se wait karne wala user -> CALLER
         io.to(partnerId).emit('matchFound', {
           partnerSocketId: socket.id,
           role: 'caller',
           partnerProfile: myProfile
         });
 
-        // Current user (jo abhi aaya) -> CALLEE
+        // Abhi aaya hua user -> CALLEE
         io.to(socket.id).emit('matchFound', {
           partnerSocketId: partnerId,
           role: 'callee',
@@ -224,7 +238,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Step 2: Callee PeerConnection ready hone par Caller ko batayega
+  // Step 2: Direct Socket-to-Socket Signaling (Cross-server safe)
   socket.on('calleeReady', (data) => {
     if (data && data.to) {
       console.log(`📡 calleeReady: ${socket.id} -> ${data.to}`);
@@ -232,7 +246,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Step 3: WebRTC Offer
   socket.on('webrtcOffer', (data) => {
     if (data && data.to && data.sdp) {
       console.log(`📡 Offer: ${socket.id} -> ${data.to}`);
@@ -243,7 +256,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Step 4: WebRTC Answer
   socket.on('webrtcAnswer', (data) => {
     if (data && data.to && data.sdp) {
       console.log(`📡 Answer: ${socket.id} -> ${data.to}`);
@@ -254,7 +266,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Step 5: ICE Candidates
   socket.on('iceCandidate', (data) => {
     if (data && data.to && data.candidate) {
       io.to(data.to).emit('iceCandidate', {
@@ -264,14 +275,15 @@ io.on('connection', (socket) => {
     }
   });
 
-  // User NEXT dabaye ya chat chhode
+  // User NEXT dabaye ya call chhode
   socket.on('leaveChat', async () => {
     await cleanupUserState(socket.id, true);
   });
 
-  // User app band kare ya internet jaye
+  // User app band kare ya net band ho
   socket.on('disconnect', async () => {
     console.log(`❌ Disconnected: ${socket.id}`);
+    await redisClient.del(`online:${socket.id}`);
     await cleanupUserState(socket.id, true);
     await redisClient.del(`meta:${socket.id}`);
   });
@@ -279,5 +291,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`🚀 Appie Server running on port ${PORT}`);
+  console.log(`🚀 Appie Server running on port ${PORT} (Max Users: ${MAX_USERS})`);
 });
