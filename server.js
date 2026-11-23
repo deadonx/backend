@@ -7,40 +7,50 @@ const { createAdapter } = require('@socket.io/redis-adapter');
 
 const app = express();
 app.use(cors());
+app.use(express.json());
+
 const server = http.createServer(app);
 
 // ==========================================
-// 🔥 SUPABASE CONFIG 🔥
+// 1. CONFIG (SUPABASE & UPSTASH REDIS)
 // ==========================================
-const SUPABASE_URL = "https://pxzofsaallaeezqyofin.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB4em9mc2FhbGxhZWV6cXlvZmluIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2Njk0MDYsImV4cCI6MjEwODI0NTQwNn0.yiPaUkq6GRNK8rB-wYqj9hlZTr7Mp4_6fPCk-Vv-Lgw";
-
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://pxzofsaallaeezqyofin.supabase.co";
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB4em9mc2FhbGxhZWV6cXlvZmluIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI2Njk0MDYsImV4cCI6MjEwODI0NTQwNn0.yiPaUkq6GRNK8rB-wYqj9hlZTr7Mp4_6fPCk-Vv-Lgw";
 const REDIS_URL = process.env.REDIS_URL || "rediss://default:gQAAAAAAAcMpAAIgcDI3M2UyMDQwNGJhN2M0MWNhYmVlNGQzYTlmY2EyMzlmMQ@credible-sunbird-115497.upstash.io:6379";
 
 const redisOptions = {
   tls: { rejectUnauthorized: false },
-  retryStrategy: (times) => Math.min(times * 50, 2000)
+  maxRetriesPerRequest: null,
+  retryStrategy: (times) => Math.min(times * 100, 3000)
 };
 
 const pubClient = new Redis(REDIS_URL, redisOptions);
 const subClient = pubClient.duplicate();
 const redisClient = new Redis(REDIS_URL, redisOptions);
 
+// Redis disconnect par server crash hone se bachane ke liye
+pubClient.on('connect', () => console.log('🔥 Redis Pub Connected'));
+pubClient.on('error', (err) => console.error('Redis Pub Error:', err.message));
+subClient.on('error', (err) => console.error('Redis Sub Error:', err.message));
+redisClient.on('error', (err) => console.error('Redis Client Error:', err.message));
+
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
+  transports: ["websocket", "polling"],
   pingTimeout: 10000,
   pingInterval: 5000
 });
 
+// 2 servers ko aapas mein jodne wala Redis Adapter
 io.adapter(createAdapter(pubClient, subClient));
 
-pubClient.on('connect', () => console.log('🔥 Redis Pub/Sub Connected!'));
-
 // ==========================================
-// 🔥 REST APIs (Android App Data ke liye) 🔥
+// 2. REST APIs (HEALTH + SUPABASE)
 // ==========================================
+app.get('/', (req, res) => {
+  res.send('Appie Signaling Server is Running');
+});
 
-// 1. App open hone par Profile Data lane ke liye API
 app.get('/getProfile', async (req, res) => {
   const uid = req.query.uid;
   if (!uid) return res.status(400).json({ error: "UID missing" });
@@ -53,19 +63,17 @@ app.get('/getProfile', async (req, res) => {
       }
     });
     const data = await response.json();
-
-    if (data && data.length > 0) {
+    if (Array.isArray(data) && data.length > 0) {
       res.json(data[0]);
     } else {
-      res.json({ error: "Profile not found" });
+      res.status(404).json({ error: "Profile not found" });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// 2. Call khatam hone ke baad EXP update karne ke liye API
-app.post('/updateExp', express.json(), async (req, res) => {
+app.post('/updateExp', async (req, res) => {
   const { uid, newExp } = req.body;
   if (!uid || newExp === undefined) return res.status(400).json({ error: "Data missing" });
 
@@ -87,30 +95,70 @@ app.post('/updateExp', express.json(), async (req, res) => {
 });
 
 // ==========================================
-// 🔥 SOCKET.IO LIVE MATCHMAKING LOGIC 🔥
+// 3. REDIS HELPER FUNCTIONS
 // ==========================================
+const QUEUE_KEY = 'appie:waiting_queue';
+const LOCK_KEY = 'appie:match_lock';
 
+async function acquireLock() {
+  for (let i = 0; i < 25; i++) {
+    const acquired = await redisClient.set(LOCK_KEY, '1', 'PX', 2500, 'NX');
+    if (acquired) return true;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  return false;
+}
+
+async function releaseLock() {
+  try {
+    await redisClient.del(LOCK_KEY);
+  } catch (e) {}
+}
+
+async function cleanupUserState(socketId, notifyPartner = true) {
+  try {
+    await redisClient.lrem(QUEUE_KEY, 0, socketId);
+    const partnerId = await redisClient.get(`partner:${socketId}`);
+
+    if (partnerId) {
+      await redisClient.del(`partner:${socketId}`);
+      await redisClient.del(`partner:${partnerId}`);
+      if (notifyPartner) {
+        io.to(partnerId).emit('strangerDisconnected', { from: socketId });
+      }
+    }
+  } catch (err) {
+    console.error('Cleanup error:', err.message);
+  }
+}
+
+// ==========================================
+// 4. SOCKET.IO MATCHMAKING & SIGNALING
+// ==========================================
 io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
+  console.log(`✅ Connected: ${socket.id}`);
 
+  // Step 1: User starts searching
   socket.on('findStranger', async (userProfile) => {
+    const locked = await acquireLock();
     try {
-      await redisClient.lrem('appie_waiting_queue', 0, socket.id);
+      // Purani koi call ya queue entry saaf karein
+      await cleanupUserState(socket.id, true);
 
-      const myMeta = (typeof userProfile === 'object' && userProfile !== null) ? userProfile : {};
-      myMeta.socketId = socket.id;
-      await redisClient.set(`meta:${socket.id}`, JSON.stringify(myMeta), 'EX', 120);
+      const myProfile = (userProfile && typeof userProfile === 'object') ? userProfile : {};
+      myProfile.socketId = socket.id;
+      await redisClient.set(`meta:${socket.id}`, JSON.stringify(myProfile), 'EX', 300);
 
-      let matchedPartnerId = null;
-      let partnerMeta = {};
+      let partnerId = null;
+      let partnerProfile = null;
+      const skippedIds = [];
 
       while (true) {
-        const candidateId = await redisClient.lpop('appie_waiting_queue');
+        const candidateId = await redisClient.lpop(QUEUE_KEY);
         if (!candidateId) break;
-
         if (candidateId === socket.id) continue;
 
-        // 🔥 FIX: Check karo ki candidate abhi sach mein online hai (ghost socket skip karo)
+        // Check across ALL servers ki candidate zinda hai ya nahi
         const activeSockets = await io.in(candidateId).fetchSockets();
         if (!activeSockets || activeSockets.length === 0) {
           await redisClient.del(`meta:${candidateId}`);
@@ -120,101 +168,111 @@ io.on('connection', (socket) => {
         const rawMeta = await redisClient.get(`meta:${candidateId}`);
         if (!rawMeta) continue;
 
-        try { partnerMeta = JSON.parse(rawMeta); } catch (e) {}
-
-        if (myMeta.uid && partnerMeta.uid && myMeta.uid === partnerMeta.uid) {
-          await redisClient.rpush('appie_waiting_queue', candidateId);
-          break;
+        let candidateProfile = {};
+        try {
+          candidateProfile = JSON.parse(rawMeta);
+        } catch (e) {
+          continue;
         }
 
-        matchedPartnerId = candidateId;
+        // Same user (same UID) ko khud se match mat hone do
+        if (myProfile.uid && candidateProfile.uid && myProfile.uid === candidateProfile.uid) {
+          skippedIds.push(candidateId);
+          continue;
+        }
+
+        partnerId = candidateId;
+        partnerProfile = candidateProfile;
         break;
       }
 
-      if (matchedPartnerId) {
-        const roomId = `room_${matchedPartnerId}_${socket.id}`;
+      // Skip kiye gaye same-UID sockets ko wapas queue mein rakhein
+      for (const id of skippedIds) {
+        await redisClient.rpush(QUEUE_KEY, id);
+      }
 
-        // 🔥 FIX 1: Dono ke room join hone ka wait karo, tab matchFound bhejo
-        await io.in(matchedPartnerId).socketsJoin(roomId);
-        await socket.join(roomId);
+      if (partnerId && partnerProfile) {
+        // Dono ka active pair Redis mein save karein
+        await redisClient.set(`partner:${partnerId}`, socket.id, 'EX', 3600);
+        await redisClient.set(`partner:${socket.id}`, partnerId, 'EX', 3600);
 
-        io.to(matchedPartnerId).emit('matchFound', {
-          roomId: roomId,
+        // Partner (jo pehle se wait kar raha tha) -> CALLER
+        io.to(partnerId).emit('matchFound', {
+          partnerSocketId: socket.id,
           role: 'caller',
-          partnerProfile: myMeta
+          partnerProfile: myProfile
         });
 
-        // 200ms baad callee ko bhejo taaki caller ka PeerConnection ready ho jaye
-        setTimeout(() => {
-          io.to(socket.id).emit('matchFound', {
-            roomId: roomId,
-            role: 'callee',
-            partnerProfile: partnerMeta
-          });
-        }, 200);
+        // Current user (jo abhi aaya) -> CALLEE
+        io.to(socket.id).emit('matchFound', {
+          partnerSocketId: partnerId,
+          role: 'callee',
+          partnerProfile: partnerProfile
+        });
 
-        console.log(`⚡ Instant Match! Room: ${roomId}`);
+        console.log(`⚡ Match: Caller(${partnerId}) <-> Callee(${socket.id})`);
       } else {
-        await redisClient.rpush('appie_waiting_queue', socket.id);
-        await redisClient.expire('appie_waiting_queue', 120);
-        console.log(`User ${socket.id} waiting in Redis queue...`);
+        await redisClient.rpush(QUEUE_KEY, socket.id);
+        await redisClient.expire(QUEUE_KEY, 300);
+        socket.emit('waiting');
+        console.log(`⏳ Waiting in queue: ${socket.id}`);
       }
     } catch (err) {
-      console.error('Matchmaking Error:', err);
+      console.error('Matchmaking error:', err.message);
+    } finally {
+      if (locked) await releaseLock();
     }
   });
 
-  socket.on('joinRoom', async (roomId) => {
-    if (roomId) await socket.join(roomId);
-  });
-
-  socket.on('calleeReady', (roomId) => {
-    if (roomId) {
-      console.log(`📡 calleeReady in ${roomId}`);
-      socket.to(roomId).emit('calleeReady');
+  // Step 2: Callee PeerConnection ready hone par Caller ko batayega
+  socket.on('calleeReady', (data) => {
+    if (data && data.to) {
+      console.log(`📡 calleeReady: ${socket.id} -> ${data.to}`);
+      io.to(data.to).emit('calleeReady', { from: socket.id });
     }
   });
 
+  // Step 3: WebRTC Offer
   socket.on('webrtcOffer', (data) => {
-    if (data && data.roomId) {
-      console.log(`📡 webrtcOffer in ${data.roomId}`);
-      socket.to(data.roomId).emit('webrtcOffer', data.offer || data);
+    if (data && data.to && data.sdp) {
+      console.log(`📡 Offer: ${socket.id} -> ${data.to}`);
+      io.to(data.to).emit('webrtcOffer', {
+        from: socket.id,
+        sdp: data.sdp
+      });
     }
   });
 
+  // Step 4: WebRTC Answer
   socket.on('webrtcAnswer', (data) => {
-    if (data && data.roomId) {
-      console.log(`📡 webrtcAnswer in ${data.roomId}`);
-      socket.to(data.roomId).emit('webrtcAnswer', data.answer || data);
+    if (data && data.to && data.sdp) {
+      console.log(`📡 Answer: ${socket.id} -> ${data.to}`);
+      io.to(data.to).emit('webrtcAnswer', {
+        from: socket.id,
+        sdp: data.sdp
+      });
     }
   });
 
+  // Step 5: ICE Candidates
   socket.on('iceCandidate', (data) => {
-    if (data && data.roomId) socket.to(data.roomId).emit('iceCandidate', data.candidate || data);
+    if (data && data.to && data.candidate) {
+      io.to(data.to).emit('iceCandidate', {
+        from: socket.id,
+        candidate: data.candidate
+      });
+    }
   });
 
+  // User NEXT dabaye ya chat chhode
   socket.on('leaveChat', async () => {
-    await redisClient.lrem('appie_waiting_queue', 0, socket.id);
-    socket.rooms.forEach((roomId) => {
-      if (roomId !== socket.id) {
-        socket.to(roomId).emit('strangerDisconnected');
-        socket.leave(roomId);
-      }
-    });
+    await cleanupUserState(socket.id, true);
   });
 
-  // 🔥 FIX 2: 'disconnecting' par rooms milte hain, 'disconnect' par khali ho jate hain
-  socket.on('disconnecting', () => {
-    socket.rooms.forEach((roomId) => {
-      if (roomId !== socket.id) {
-        socket.to(roomId).emit('strangerDisconnected');
-      }
-    });
-  });
-
+  // User app band kare ya internet jaye
   socket.on('disconnect', async () => {
-    console.log('User disconnected:', socket.id);
-    await redisClient.lrem('appie_waiting_queue', 0, socket.id);
+    console.log(`❌ Disconnected: ${socket.id}`);
+    await cleanupUserState(socket.id, true);
     await redisClient.del(`meta:${socket.id}`);
   });
 });
