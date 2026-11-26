@@ -46,7 +46,7 @@ const io = new Server(server, {
 io.adapter(createAdapter(pubClient, subClient));
 
 // ==========================================
-// 2. ATOMIC LUA SCRIPT (ZERO LOCK, 1ms MATCH)
+// 2. ATOMIC LUA MATCHMAKING (1ms, ZERO LOCK)
 // ==========================================
 const MATCH_LUA = `
 local queueKey = KEYS[1]
@@ -150,7 +150,7 @@ app.post('/updateExp', async (req, res) => {
 });
 
 // ==========================================
-// 4. CLEANUP HELPER
+// 4. PARTNER CLEANUP HELPER
 // ==========================================
 async function leavePartner(socketId) {
   try {
@@ -166,7 +166,7 @@ async function leavePartner(socketId) {
 }
 
 // ==========================================
-// 5. SOCKET.IO INSTANT MATCHMAKING
+// 5. SOCKET.IO MATCHMAKING & DIRECT SIGNALING
 // ==========================================
 io.on('connection', (socket) => {
   if (io.engine.clientsCount > MAX_USERS) {
@@ -199,21 +199,21 @@ io.on('connection', (socket) => {
         let partnerProfile = {};
         try { partnerProfile = JSON.parse(result[1]); } catch (e) {}
 
-        // Pehle wait karne wala = Caller (direct offer bhejega)
-        io.to(partnerId).emit('match', {
+        // Pehle wait karne wala = Caller
+        io.to(partnerId).emit('matchFound', {
           partnerId: socket.id,
           role: 'caller',
           profile: myProfile
         });
 
-        // Abhi aaya hua = Callee
-        io.to(socket.id).emit('match', {
+        // Abhi aaya hua = Callee (PeerConnection banakar calleeReady bhejega)
+        io.to(socket.id).emit('matchFound', {
           partnerId: partnerId,
           role: 'callee',
           profile: partnerProfile
         });
 
-        console.log(`⚡ Matched: ${partnerId} (caller) <-> ${socket.id} (callee)`);
+        console.log(`⚡ Match: Caller(${partnerId}) <-> Callee(${socket.id})`);
       } else {
         console.log(`⏳ Waiting: ${socket.id}`);
       }
@@ -222,22 +222,31 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Direct Signaling (No rooms, works across Server 1 & Server 2)
-  socket.on('offer', (data) => {
-    if (data && data.to && data.sdp) {
-      io.to(data.to).emit('offer', { from: socket.id, sdp: data.sdp });
+  // Proven calleeReady -> webrtcOffer -> webrtcAnswer -> iceCandidate (2-server safe)
+  socket.on('calleeReady', (data) => {
+    if (data && data.to) {
+      console.log(`📡 calleeReady: ${socket.id} -> ${data.to}`);
+      io.to(data.to).emit('calleeReady', { from: socket.id });
     }
   });
 
-  socket.on('answer', (data) => {
+  socket.on('webrtcOffer', (data) => {
     if (data && data.to && data.sdp) {
-      io.to(data.to).emit('answer', { from: socket.id, sdp: data.sdp });
+      console.log(`📡 Offer: ${socket.id} -> ${data.to}`);
+      io.to(data.to).emit('webrtcOffer', { from: socket.id, sdp: data.sdp });
     }
   });
 
-  socket.on('ice', (data) => {
+  socket.on('webrtcAnswer', (data) => {
+    if (data && data.to && data.sdp) {
+      console.log(`📡 Answer: ${socket.id} -> ${data.to}`);
+      io.to(data.to).emit('webrtcAnswer', { from: socket.id, sdp: data.sdp });
+    }
+  });
+
+  socket.on('iceCandidate', (data) => {
     if (data && data.to && data.candidate) {
-      io.to(data.to).emit('ice', { from: socket.id, candidate: data.candidate });
+      io.to(data.to).emit('iceCandidate', { from: socket.id, candidate: data.candidate });
     }
   });
 
@@ -254,5 +263,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-  console.log(`🚀 Appie Lite Server running on port ${PORT} (Max: ${MAX_USERS})`);
+  console.log(`🚀 Appie Server running on port ${PORT} (Max: ${MAX_USERS})`);
 });
